@@ -1,293 +1,244 @@
---!strict
-
--- Services
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-
--- References
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
 local PlaceBlockEvent = ReplicatedStorage:WaitForChild("PlaceBlockEvent")
 local Tool = script.Parent
-
 local Player = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
-
--- Constants
-local GRID_SIZE = 3
-local MAX_PLACE_DISTANCE = 18
-local GROUND_SEARCH_DEPTH = -10
-local PLACE_COOLDOWN = 0.05
-
-local BLOCK_SIZE = Vector3.one * GRID_SIZE
-local PLANAR_MASK = Vector3.new(1, 0, 1)
-
 local Character = Player.Character or Player.CharacterAdded:Wait()
-local RootPart = Character:WaitForChild("HumanoidRootPart") :: BasePart
-
-local LastPlacementTime = 0
-local PendingPlacement: Vector3?
-
-local Connections: {[string]: RBXScriptConnection} = {}
-
-local RaycastParams = RaycastParams.new()
-RaycastParams.FilterType = Enum.RaycastFilterType.Exclude
-RaycastParams.FilterDescendantsInstances = {Character}
-
-local OverlapParams = OverlapParams.new()
-OverlapParams.FilterType = Enum.RaycastFilterType.Exclude
-OverlapParams.FilterDescendantsInstances = {Character}
-
-local function roundToGrid(value: number): number
-	return math.floor(value / GRID_SIZE + 0.5) * GRID_SIZE
+local RootPart = Character:WaitForChild("HumanoidRootPart")
+local Configuration = {}
+Configuration.GridSize = 3
+Configuration.MaxDistance = 18
+Configuration.DepthSearch = -10
+Configuration.Cooldown = 0.1
+Configuration.GhostAlpha = 0.6
+Configuration.GhostValidColor = Color3.fromRGB(100, 255, 100)
+Configuration.GhostInvalidColor = Color3.fromRGB(255, 100, 100)
+Configuration.LerpSpeed = 25
+local CurrentState = {}
+CurrentState.LastPlaceTime = 0
+CurrentState.PendingPosition = nil
+CurrentState.IsPlacementValid = false
+CurrentState.RotationAngle = 0
+CurrentState.ActiveConnections = {}
+local PlacementSound = Instance.new("Sound")
+PlacementSound.SoundId = "rbxassetid://876939830"
+PlacementSound.Volume = 0.5
+PlacementSound.Parent = Tool
+local function CreateRaycastFilter()
+local filter = RaycastParams.new()
+filter.FilterType = Enum.RaycastFilterType.Exclude
+filter.FilterDescendantsInstances = {Character}
+filter.IgnoreWater = true
+return filter
 end
-
-local function snapToGrid(position: Vector3): Vector3
-	return Vector3.new(
-		roundToGrid(position.X),
-		roundToGrid(position.Y),
-		roundToGrid(position.Z)
-	)
+local function CreateOverlapFilter()
+local filter = OverlapParams.new()
+filter.FilterType = Enum.RaycastFilterType.Exclude
+filter.FilterDescendantsInstances = {Character}
+filter.MaxParts = 100
+return filter
 end
-
-local function isPlacementAreaEmpty(position: Vector3): boolean
-	local parts = workspace:GetPartBoundsInBox(
-		CFrame.new(position),
-		BLOCK_SIZE - Vector3.new(0.1, 0.1, 0.1),
-		OverlapParams
-	)
-
-	return #parts == 0
+local PrimaryRaycastFilter = CreateRaycastFilter()
+local PrimaryOverlapFilter = CreateOverlapFilter()
+local function GetSnappedCoordinate(value)
+local scaledValue = value / Configuration.GridSize
+local roundedValue = math.floor(scaledValue + 0.5)
+return roundedValue * Configuration.GridSize
 end
-
-local function createGhost(): Part
-	local ghost = Instance.new("Part")
-
-	ghost.Name = "PlacementGhost"
-	ghost.Anchored = true
-	ghost.CanCollide = false
-	ghost.CanQuery = false
-	ghost.CanTouch = false
-
-	ghost.Size = BLOCK_SIZE
-	ghost.Material = Enum.Material.ForceField
-	ghost.Color = Color3.fromRGB(240, 240, 240)
-	ghost.Transparency = 1
-
-	local selectionBox = Instance.new("SelectionBox")
-	selectionBox.Adornee = ghost
-	selectionBox.LineThickness = 0.03
-	selectionBox.Color3 = Color3.new()
-	selectionBox.SurfaceTransparency = 1
-	selectionBox.Parent = ghost
-
-	return ghost
+local function SnapVectorToGrid(vector)
+local snapX = GetSnappedCoordinate(vector.X)
+local snapY = GetSnappedCoordinate(vector.Y)
+local snapZ = GetSnappedCoordinate(vector.Z)
+return Vector3.new(snapX, snapY, snapZ)
 end
-
-local Ghost = createGhost()
-
-local function showGhost(position: Vector3)
-	Ghost.Position = position
-
-	if not Ghost.Parent then
-		Ghost.Parent = workspace
-	end
+local function ValidatePlacementArea(targetPosition)
+local targetCFrame = CFrame.new(targetPosition)
+local tolerance = Vector3.new(0.1, 0.1, 0.1)
+local blockSize = Vector3.one * Configuration.GridSize
+local searchBounds = blockSize - tolerance
+local intersectingParts = workspace:GetPartBoundsInBox(targetCFrame, searchBounds, PrimaryOverlapFilter)
+return #intersectingParts == 0
 end
-
-local function hideGhost()
-	Ghost.Parent = nil
+local function InitializeGhostPart()
+local part = Instance.new("Part")
+part.Name = "PlacementGhost"
+part.Anchored = true
+part.CanCollide = false
+part.CanQuery = false
+part.CanTouch = false
+part.CastShadow = false
+part.Size = Vector3.one * Configuration.GridSize
+part.Material = Enum.Material.SmoothPlastic
+part.Transparency = Configuration.GhostAlpha
+local highlight = Instance.new("SelectionBox")
+highlight.Adornee = part
+highlight.LineThickness = 0.04
+highlight.Color3 = Color3.new(1, 1, 1)
+highlight.Parent = part
+return part
 end
-
-local function findGroundAnchor(position: Vector3): Vector3?
-	local result = workspace:Raycast(
-		position,
-		Vector3.new(0, GROUND_SEARCH_DEPTH, 0),
-		RaycastParams
-	)
-
-	if not result then
-		return nil
-	end
-
-	return snapToGrid(
-		result.Position - result.Normal * (GRID_SIZE * 0.5)
-	)
+local GhostInstance = InitializeGhostPart()
+local function UpdateGhostAppearance(targetPosition, deltaTime)
+if not GhostInstance.Parent then
+GhostInstance.Parent = workspace
+GhostInstance.Position = targetPosition
 end
-
-local function findNearbyAnchor(position: Vector3): Vector3?
-	local nearbyParts = workspace:GetPartBoundsInRadius(
-		position,
-		MAX_PLACE_DISTANCE,
-		OverlapParams
-	)
-
-	local nearestAnchor: Vector3?
-	local nearestDistance: number?
-
-	for _, part in nearbyParts do
-		local distance = (part.Position - position).Magnitude
-
-		if not nearestDistance or distance < nearestDistance then
-			nearestDistance = distance
-			nearestAnchor = snapToGrid(part.Position)
-		end
-	end
-
-	return nearestAnchor
+local rotationMatrix = CFrame.Angles(0, math.rad(CurrentState.RotationAngle), 0)
+local targetCFrame = CFrame.new(targetPosition) * rotationMatrix
+GhostInstance.CFrame = GhostInstance.CFrame:Lerp(targetCFrame, math.min(1, deltaTime * Configuration.LerpSpeed))
+if CurrentState.IsPlacementValid then
+GhostInstance.Color = Configuration.GhostValidColor
+else
+GhostInstance.Color = Configuration.GhostInvalidColor
 end
-
-local function calculatePlacementPosition(
-	mouseHit: RaycastResult?,
-	mouseRay: Ray
-): Vector3?
-
-	local origin = RootPart.Position
-
-	if mouseHit then
-		return snapToGrid(
-			mouseHit.Position + mouseHit.Normal * (GRID_SIZE * 0.5)
-		)
-	end
-
-	local anchor =
-		findGroundAnchor(origin)
-		or findNearbyAnchor(origin)
-
-	if not anchor then
-		return nil
-	end
-
-	local rayOrigin = mouseRay.Origin
-	local rayDirection = mouseRay.Direction
-
-	if math.abs(rayDirection.Y) < 0.001 then
-		return nil
-	end
-
-	local planeDistance =
-		(anchor.Y - rayOrigin.Y) / rayDirection.Y
-
-	local projectedPoint =
-		rayOrigin + rayDirection * planeDistance
-
-	local planarOffset =
-		(projectedPoint - origin) * PLANAR_MASK
-
-	if planarOffset.Magnitude < 0.001 then
-		return nil
-	end
-
-	local placementDirection = planarOffset.Unit
-
-	for step = 1, math.floor(MAX_PLACE_DISTANCE / GRID_SIZE) do
-		local candidatePosition = snapToGrid(
-			anchor + placementDirection * GRID_SIZE * step
-		)
-
-		if (candidatePosition - origin).Magnitude > MAX_PLACE_DISTANCE then
-			break
-		end
-
-		if isPlacementAreaEmpty(candidatePosition) then
-			return candidatePosition
-		end
-	end
-
-	return nil
 end
-
-local function getMouseRaycast(): (RaycastResult?, Ray)
-	local mousePosition = UserInputService:GetMouseLocation()
-
-	local mouseRay = Camera:ViewportPointToRay(
-		mousePosition.X,
-		mousePosition.Y
-	)
-
-	local characterDistance =
-		(RootPart.Position - mouseRay.Origin).Magnitude
-
-	local result = workspace:Raycast(
-		mouseRay.Origin,
-		mouseRay.Direction * (characterDistance + MAX_PLACE_DISTANCE),
-		RaycastParams
-	)
-
-	return result, mouseRay
+local function HideGhostVisuals()
+GhostInstance.Parent = nil
 end
-
-local function placeBlock()
-	if not PendingPlacement then
-		return
-	end
-
-	local currentTime = os.clock()
-
-	if currentTime - LastPlacementTime < PLACE_COOLDOWN then
-		return
-	end
-
-	LastPlacementTime = currentTime
-
-	PlaceBlockEvent:InvokeServer(PendingPlacement)
+local function FindAnchorFromGround(origin)
+local downwardVector = Vector3.new(0, Configuration.DepthSearch, 0)
+local result = workspace:Raycast(origin, downwardVector, PrimaryRaycastFilter)
+if not result then
+return nil
 end
-
-local function disconnectAll()
-	for _, connection in Connections do
-		connection:Disconnect()
-	end
-
-	table.clear(Connections)
+local offsetNormal = result.Normal * (Configuration.GridSize * 0.5)
+return SnapVectorToGrid(result.Position - offsetNormal)
 end
-
-local function onEquipped()
-	Connections.UpdateLoop = RunService.PostSimulation:Connect(function()
-		local mouseHit, mouseRay = getMouseRaycast()
-
-		local placementPosition =
-			calculatePlacementPosition(mouseHit, mouseRay)
-
-		PendingPlacement = placementPosition
-
-		if not placementPosition then
-			hideGhost()
-			return
-		end
-
-		local previewPosition = placementPosition
-
-		if mouseHit then
-			previewPosition -= mouseHit.Normal * GRID_SIZE
-		end
-
-		showGhost(previewPosition)
-	end)
-
-	Connections.InputBegan = UserInputService.InputBegan:Connect(function(
-		input: InputObject,
-		gameProcessed: boolean
-	)
-		if gameProcessed then
-			return
-		end
-
-		local inputType = input.UserInputType
-
-		if inputType ~= Enum.UserInputType.MouseButton1
-			and inputType ~= Enum.UserInputType.Touch
-		then
-			return
-		end
-
-		placeBlock()
-	end)
+local function FindAnchorFromEnvironment(origin)
+local parts = workspace:GetPartBoundsInRadius(origin, Configuration.MaxDistance, PrimaryOverlapFilter)
+local closestAnchor = nil
+local minDistance = math.huge
+for index, part in ipairs(parts) do
+local dist = (part.Position - origin).Magnitude
+if dist < minDistance then
+minDistance = dist
+closestAnchor = SnapVectorToGrid(part.Position)
 end
-
-local function onUnequipped()
-	disconnectAll()
-	PendingPlacement = nil
-	hideGhost()
 end
-
-Tool.Equipped:Connect(onEquipped)
-Tool.Unequipped:Connect(onUnequipped)
+return closestAnchor
+end
+local function ResolvePlacementPosition(mouseHit, mouseRay)
+local rootPosition = RootPart.Position
+if mouseHit then
+local normalOffset = mouseHit.Normal * (Configuration.GridSize * 0.5)
+return SnapVectorToGrid(mouseHit.Position + normalOffset)
+end
+local validAnchor = FindAnchorFromGround(rootPosition) or FindAnchorFromEnvironment(rootPosition)
+if not validAnchor then
+return nil
+end
+local rayDir = mouseRay.Direction
+if math.abs(rayDir.Y) < 0.001 then
+return nil
+end
+local planeDistance = (validAnchor.Y - mouseRay.Origin.Y) / rayDir.Y
+local projectedHit = mouseRay.Origin + (rayDir * planeDistance)
+local planarDifference = (projectedHit - rootPosition) * Vector3.new(1, 0, 1)
+if planarDifference.Magnitude < 0.001 then
+return nil
+end
+local placementDirection = planarDifference.Unit
+local maxIterations = math.floor(Configuration.MaxDistance / Configuration.GridSize)
+for stepIndex = 1, maxIterations do
+local stepOffset = placementDirection * (Configuration.GridSize * stepIndex)
+local candidatePosition = SnapVectorToGrid(validAnchor + stepOffset)
+local distanceFromRoot = (candidatePosition - rootPosition).Magnitude
+if distanceFromRoot > Configuration.MaxDistance then
+break
+end
+if ValidatePlacementArea(candidatePosition) then
+return candidatePosition
+end
+end
+return nil
+end
+local function CastViewportRay()
+local mousePos = UserInputService:GetMouseLocation()
+local viewportRay = Camera:ViewportPointToRay(mousePos.X, mousePos.Y)
+local distanceToRoot = (RootPart.Position - viewportRay.Origin).Magnitude
+local rayDistance = distanceToRoot + Configuration.MaxDistance
+local result = workspace:Raycast(viewportRay.Origin, viewportRay.Direction * rayDistance, PrimaryRaycastFilter)
+return result, viewportRay
+end
+local function TriggerBlockPlacement()
+if not CurrentState.PendingPosition then
+return
+end
+if not CurrentState.IsPlacementValid then
+return
+end
+local timeNow = os.clock()
+if timeNow - CurrentState.LastPlaceTime < Configuration.Cooldown then
+return
+end
+CurrentState.LastPlaceTime = timeNow
+PlacementSound:Play()
+local finalCFrame = CFrame.new(CurrentState.PendingPosition) * CFrame.Angles(0, math.rad(CurrentState.RotationAngle), 0)
+PlaceBlockEvent:InvokeServer(finalCFrame)
+end
+local function ProcessKeyboardInput(input, processed)
+if processed then
+return
+end
+if input.UserInputState ~= Enum.UserInputState.Begin then
+return
+end
+if input.KeyCode == Enum.KeyCode.R then
+CurrentState.RotationAngle = (CurrentState.RotationAngle + 90) % 360
+end
+end
+local function ProcessMouseInput(input, processed)
+if processed then
+return
+end
+if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
+return
+end
+if input.UserInputState == Enum.UserInputState.Begin then
+TriggerBlockPlacement()
+end
+end
+local function ClearToolConnections()
+for key, connection in pairs(CurrentState.ActiveConnections) do
+if connection then
+connection:Disconnect()
+end
+end
+table.clear(CurrentState.ActiveConnections)
+end
+local function ExecuteRenderStep(deltaTime)
+local hitResult, rayResult = CastViewportRay()
+local targetPosition = ResolvePlacementPosition(hitResult, rayResult)
+CurrentState.PendingPosition = targetPosition
+if not targetPosition then
+HideGhostVisuals()
+CurrentState.IsPlacementValid = false
+return
+end
+local visualPosition = targetPosition
+if hitResult then
+visualPosition = visualPosition - (hitResult.Normal * Configuration.GridSize)
+end
+CurrentState.IsPlacementValid = ValidatePlacementArea(targetPosition)
+UpdateGhostAppearance(visualPosition, deltaTime)
+end
+local function HandleToolEquip()
+CurrentState.ActiveConnections.RenderUpdate = RunService.RenderStepped:Connect(ExecuteRenderStep)
+CurrentState.ActiveConnections.MouseClick = UserInputService.InputBegan:Connect(ProcessMouseInput)
+CurrentState.ActiveConnections.KeyPress = UserInputService.InputBegan:Connect(ProcessKeyboardInput)
+CurrentState.RotationAngle = 0
+end
+local function HandleToolUnequip()
+ClearToolConnections()
+CurrentState.PendingPosition = nil
+CurrentState.IsPlacementValid = false
+CurrentState.RotationAngle = 0
+HideGhostVisuals()
+end
+Tool.Equipped:Connect(HandleToolEquip)
+Tool.Unequipped:Connect(HandleToolUnequip)
